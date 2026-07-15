@@ -121,18 +121,34 @@ class DockerBackend(Backend):
         log.info("Provisioning container %s for user %s (policy=%s)", instance_name, user_id, policy_id)
 
         max_conflict_retries = 3
+        container = None
         for attempt in range(max_conflict_retries + 1):
             try:
-                container = await docker.containers.create_or_replace(
-                    name=instance_name,
+                # Plain create (not create_or_replace): a name conflict means
+                # another worker process provisioned this terminal first, and
+                # replacing it would kill the user's live sessions.
+                container = await docker.containers.create(
                     config=config,
+                    name=instance_name,
                 )
                 await container.start()
                 break
             except aiodocker.exceptions.DockerError as exc:
                 if exc.status == 409 and attempt < max_conflict_retries:
+                    # Give a concurrently-provisioning worker a moment to
+                    # start its container, then adopt it if it's running.
+                    await asyncio.sleep(1)
+                    existing = await self.lookup(user_id, policy_id)
+                    if existing:
+                        log.info(
+                            "Adopting container %s created concurrently by another worker",
+                            instance_name,
+                        )
+                        await self._wait_until_ready(existing, timeout=15)
+                        return existing
+                    # Not running — a stale container is squatting the name.
                     log.warning(
-                        "Container %s conflict (attempt %d/%d), force-removing and retrying",
+                        "Container %s conflict (attempt %d/%d), removing stale container and retrying",
                         instance_name, attempt + 1, max_conflict_retries,
                     )
                     try:
@@ -140,7 +156,6 @@ class DockerBackend(Backend):
                         await old.delete(force=True)
                     except aiodocker.exceptions.DockerError:
                         pass
-                    await asyncio.sleep(1)
                     continue
                 # The storage driver may not support StorageOpt size quotas
                 # (e.g. overlay2 on ext4).  Drop the quota and retry once rather
@@ -157,6 +172,12 @@ class DockerBackend(Backend):
                     continue
                 log.error("Failed to provision container for %s: %s", user_id, exc)
                 raise
+
+        if container is None:
+            raise RuntimeError(
+                f"Failed to provision container {instance_name}: "
+                "retries exhausted without resolving the name conflict"
+            )
 
         result = await self._extract_instance_info(container, instance_name, api_key)
         await self._wait_until_ready(result, timeout=15)
@@ -179,14 +200,24 @@ class DockerBackend(Backend):
             await asyncio.sleep(0.5)
         log.warning("Container %s did not become ready within %ds", instance["instance_name"], timeout)
 
+    @staticmethod
+    def _api_key_from_env(info: dict) -> str:
+        """Extract the terminal API key from a container inspect payload."""
+        for entry in info.get("Config", {}).get("Env", []) or []:
+            if entry.startswith("OPEN_TERMINAL_API_KEY="):
+                return entry.split("=", 1)[1]
+        return ""
+
     async def _extract_instance_info(
         self,
         container,
         instance_name: str,
         api_key: str,
+        info: Optional[dict] = None,
     ) -> dict:
         """Read container metadata and return the instance info dict."""
-        info = await container.show()
+        if info is None:
+            info = await container.show()
         instance_id = info["Id"]
 
         # When using a custom Docker network, containers can reach each other
@@ -213,6 +244,39 @@ class DockerBackend(Backend):
             "host": host,
             "port": port,
         }
+
+    # ------------------------------------------------------------------
+    # Discovery — adopt containers created by other worker processes
+    # ------------------------------------------------------------------
+
+    async def lookup(
+        self, user_id: str, policy_id: str = "default"
+    ) -> Optional[dict]:
+        """Find a running container for user+policy by its deterministic name.
+
+        Lets additional uvicorn workers (or a restarted process) adopt an
+        existing container instead of create-or-replacing it, which would
+        kill the user's live sessions.
+        """
+        docker = await self._get_docker()
+        instance_name = self._container_name(policy_id, user_id)
+        try:
+            container = await docker.containers.get(instance_name)
+            info = await container.show()
+        except aiodocker.exceptions.DockerError:
+            return None
+
+        if not info.get("State", {}).get("Running"):
+            return None
+
+        labels = info.get("Config", {}).get("Labels") or {}
+        if labels.get("app.kubernetes.io/managed-by") != "terminals":
+            return None
+
+        api_key = self._api_key_from_env(info)
+        return await self._extract_instance_info(
+            container, instance_name, api_key, info=info
+        )
 
     # ------------------------------------------------------------------
     # Reconciliation — rediscover running containers on startup
@@ -252,15 +316,10 @@ class DockerBackend(Backend):
             if key in self._instances:
                 continue
 
-            # Extract API key from container env
-            env_list = info.get("Config", {}).get("Env", [])
-            api_key = ""
-            for entry in env_list:
-                if entry.startswith("OPEN_TERMINAL_API_KEY="):
-                    api_key = entry.split("=", 1)[1]
-                    break
-
-            instance_info = await self._extract_instance_info(container, name, api_key)
+            api_key = self._api_key_from_env(info)
+            instance_info = await self._extract_instance_info(
+                container, name, api_key, info=info
+            )
             self._instances[key] = instance_info
             self._activity[key] = time.monotonic()
             recovered += 1

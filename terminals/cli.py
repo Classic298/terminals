@@ -28,7 +28,13 @@ BANNER = r"""
     default=None,
     help="Bearer API key (overrides TERMINALS_API_KEY)",
 )
-def serve(host: str | None, port: int | None, api_key: str | None):
+@click.option(
+    "--workers",
+    default=None,
+    type=int,
+    help="Number of worker processes (overrides TERMINALS_WORKERS)",
+)
+def serve(host: str | None, port: int | None, api_key: str | None, workers: int | None):
     """Start the orchestrator API server."""
     import os
     import secrets
@@ -39,6 +45,14 @@ def serve(host: str | None, port: int | None, api_key: str | None):
     # CLI flags take precedence over env/config.
     effective_host = host or settings.host
     effective_port = port or settings.port
+    effective_workers = max(1, workers if workers is not None else settings.workers)
+
+    if effective_workers > 1 and settings.backend != "docker":
+        raise click.ClickException(
+            "--workers > 1 is currently supported only with the docker backend: "
+            "the Kubernetes backends cannot yet adopt instances provisioned by "
+            f"other workers (TERMINALS_BACKEND={settings.backend})."
+        )
 
     if api_key is not None:
         os.environ["TERMINALS_API_KEY"] = api_key
@@ -62,6 +76,10 @@ def serve(host: str | None, port: int | None, api_key: str | None):
         host=effective_host,
         port=effective_port,
         log_level=normalize_log_level(settings.log_level).lower(),
+        workers=effective_workers,
+        # Terminal streams re-compressed per frame in pure Python are a major
+        # CPU cost at scale — only enable when explicitly configured.
+        ws_per_message_deflate=settings.ws_compression,
     )
 
 

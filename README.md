@@ -165,8 +165,31 @@ All settings are configured through environment variables prefixed with `TERMINA
 | `TERMINALS_KUBERNETES_TOLERATIONS` | | JSON array of Kubernetes tolerations for terminal and reset pods |
 | `TERMINALS_DATABASE_URL` | `sqlite+aiosqlite:///.../data/terminals.db` | SQLAlchemy database URL. SQLite is the default; PostgreSQL is optional. |
 | `TERMINALS_LOG_LEVEL` | `INFO` | Minimum log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
+| `TERMINALS_WORKERS` | `1` | Number of orchestrator worker processes (also `terminals serve --workers N`). Scale this up when the server process saturates a CPU core. Currently supported on the `docker` backend only. |
+| `TERMINALS_STATUS_CACHE_TTL` | `30` | Seconds a confirmed-running container status is trusted before re-inspecting it via the backend. `0` re-checks on every request. The cache is invalidated immediately when a proxied connection fails. |
+| `TERMINALS_WS_COMPRESSION` | `false` | Enable permessage-deflate on proxied WebSocket terminal traffic. Leave off unless clients connect over slow links — per-frame compression is CPU-expensive at high session counts. |
 
 See [`config.py`](terminals/config.py) for the full list.
+
+### Scaling the orchestrator
+
+A single worker process handles all proxied terminal traffic on one CPU
+core. At high session counts (hundreds of concurrent terminals), set
+`TERMINALS_WORKERS` to spread the proxy data plane across cores — workers
+discover and adopt each other's containers by their deterministic names,
+and share last-active timestamps through the database so the idle reaper
+never tears down a terminal that is active on another worker. When running
+multiple workers on SQLite the database is opened in WAL mode automatically;
+for heavy deployments PostgreSQL is recommended.
+
+Multi-worker is currently limited to the `docker` backend (`terminals serve`
+refuses `--workers > 1` otherwise). Note that the admin endpoints
+(`GET /api/v1/terminals`, `stop`, `refresh`) report and act on the instances
+tracked by whichever worker receives the request; teardown decisions still
+consult the shared activity record, but listings may show a subset of all
+terminals. If you launch uvicorn directly instead of via `terminals serve`,
+pass `--ws-per-message-deflate false` — compressing every terminal frame in
+pure Python is a major CPU cost at scale.
 
 ## Authentication
 

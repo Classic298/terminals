@@ -14,6 +14,7 @@ from terminals.config import settings
 
 # Import *all* models so Base.metadata is fully populated.
 from terminals.models.base import Base  # noqa: F401
+from terminals.models.activity import TerminalActivity  # noqa: F401
 from terminals.models.policy import Policy, PolicyLifecycle, PolicyLifecycleState  # noqa: F401
 
 # Alembic Config object — gives access to alembic.ini values.

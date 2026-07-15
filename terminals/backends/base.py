@@ -31,13 +31,20 @@ class Backend(ABC):
     ``idle_timeout_minutes``).
     """
 
+    # Seconds between persisted-activity writes per key (debounce, keeps DB
+    # traffic at ≤1 write/min per active terminal).
+    _ACTIVITY_PERSIST_INTERVAL = 60
+
     def __init__(self) -> None:
         # key = "{user_id}:{policy_id}"
         self._activity: dict[str, float] = {}      # → last-active unix timestamp
         self._activity_wall: dict[str, float] = {} # → last-active wall-clock timestamp
+        self._activity_persisted: dict[str, float] = {}  # → last DB write (wall clock)
         self._instances: dict[str, dict] = {}       # → provision result dict
         self._specs: dict[str, dict] = {}           # → resolved policy spec
         self._locks: dict[str, asyncio.Lock] = {}   # → per-key provisioning lock
+        self._status_ok_at: dict[str, float] = {}   # → last confirmed-running check
+        self._bg_tasks: set[asyncio.Task] = set()   # strong refs to persist tasks
         self._reaper_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
@@ -83,6 +90,18 @@ class Backend(ABC):
         """Delete persisted files for a user terminal."""
         raise NotImplementedError("Reset is not supported by this backend")
 
+    async def lookup(
+        self, user_id: str, policy_id: str = "default"
+    ) -> Optional[dict]:
+        """Discover an already-running instance this process isn't tracking.
+
+        Backends with deterministic instance names override this so that
+        multiple worker processes adopt each other's containers instead of
+        replacing them (which would kill live sessions). Returns the
+        instance info dict, or ``None`` if nothing suitable exists.
+        """
+        return None
+
     # ------------------------------------------------------------------
     # Instance tracking
     # ------------------------------------------------------------------
@@ -93,7 +112,143 @@ class Backend(ABC):
 
     def _record_activity(self, key: str) -> None:
         self._activity[key] = time.monotonic()
-        self._activity_wall[key] = time.time()
+        now_wall = time.time()
+        self._activity_wall[key] = now_wall
+
+        # Persist activity (debounced) so the idle reaper in *other* worker
+        # processes doesn't tear down a terminal that is active here.
+        last_persist = self._activity_persisted.get(key, 0.0)
+        if now_wall - last_persist < self._ACTIVITY_PERSIST_INTERVAL:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._activity_persisted[key] = now_wall
+        # Hold a strong reference — the loop only keeps weak refs, and a
+        # GC'd task would silently drop the write.
+        task = loop.create_task(self._persist_activity(key, now_wall))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _persist_activity(self, key: str, ts: float) -> None:
+        """Best-effort write of last-active time to the shared database."""
+        from terminals.db.session import async_session
+
+        if async_session is None:
+            return
+        try:
+            from terminals.models.activity import TerminalActivity
+
+            user_id, _, policy_id = key.partition(":")
+            async with async_session() as session:
+                row = await session.get(TerminalActivity, key)
+                if row is None:
+                    session.add(
+                        TerminalActivity(
+                            id=key,
+                            user_id=user_id,
+                            policy_id=policy_id or "default",
+                            last_active_at=ts,
+                        )
+                    )
+                elif ts > (row.last_active_at or 0.0):
+                    row.last_active_at = ts
+                await session.commit()
+        except Exception:
+            # Roll the debounce marker back so the next request retries the
+            # write instead of leaving the shared record stale for 60s.
+            if self._activity_persisted.get(key) == ts:
+                self._activity_persisted.pop(key, None)
+            log.debug("Failed to persist activity for %s", key, exc_info=True)
+
+    async def _load_persisted_activity(self, key: str) -> Optional[float]:
+        """Read the cross-worker last-active timestamp (wall clock) for *key*.
+
+        Returns ``None`` when no record exists. Database errors propagate —
+        callers about to destroy an instance must fail closed, not open.
+        """
+        from terminals.db.session import async_session
+
+        if async_session is None:
+            return None
+        from terminals.models.activity import TerminalActivity
+
+        async with async_session() as session:
+            row = await session.get(TerminalActivity, key)
+            return row.last_active_at if row else None
+
+    async def _idle_across_workers(self, key: str, spec: Optional[dict], now: float) -> bool:
+        """True when *key* is idle locally AND per the shared activity record.
+
+        The persisted timestamp lags real activity by up to
+        ``_ACTIVITY_PERSIST_INTERVAL`` (debounce), so that interval is added
+        as slack before declaring the terminal globally idle. Database
+        errors fail closed (not idle) — tearing down an active terminal is
+        worse than keeping an idle one an extra cycle.
+        """
+        if not self._is_idle_by_activity(key, spec, now):
+            return False
+        timeout_min = (spec or {}).get(
+            "idle_timeout_minutes", settings.idle_timeout_minutes
+        )
+        try:
+            persisted = await self._load_persisted_activity(key)
+        except Exception:
+            log.warning(
+                "Could not read shared activity for %s; skipping idle teardown", key
+            )
+            return False
+        if persisted is None:
+            return True
+        wall_idle = time.time() - persisted
+        return wall_idle >= timeout_min * 60 + self._ACTIVITY_PERSIST_INTERVAL
+
+    # ------------------------------------------------------------------
+    # Status cache — avoid re-inspecting the container on every request
+    # ------------------------------------------------------------------
+
+    def _status_fresh(self, key: str) -> bool:
+        ttl = settings.status_cache_ttl
+        if ttl <= 0:
+            return False
+        checked = self._status_ok_at.get(key)
+        return checked is not None and (time.monotonic() - checked) < ttl
+
+    def _mark_status_ok(self, key: str) -> None:
+        self._status_ok_at[key] = time.monotonic()
+
+    def invalidate_status(self, user_id: str, policy_id: str = "default") -> None:
+        """Force the next request for this key to re-verify instance status.
+
+        Called by the proxy when it fails to connect to an instance that
+        was assumed running.
+        """
+        self._status_ok_at.pop(self._key(user_id, policy_id), None)
+
+    def drop_instance(self, user_id: str, policy_id: str = "default") -> None:
+        """Stop tracking an unreachable instance without tearing it down.
+
+        Only backends with discovery (an overridden :meth:`lookup`) actually
+        forget the entry — their next request re-adopts the instance with
+        freshly extracted host/port, or provisions anew if it is gone. For
+        backends without discovery this only invalidates the status cache:
+        forgetting would make the next request provision a replacement over
+        a possibly-live instance.
+        """
+        if type(self).lookup is Backend.lookup:
+            self.invalidate_status(user_id, policy_id)
+            return
+        self._forget(self._key(user_id, policy_id))
+
+    def _forget(self, key: str) -> None:
+        """Drop all tracking state for *key* (not the provisioning lock)."""
+        self._instances.pop(key, None)
+        self._specs.pop(key, None)
+        self._activity.pop(key, None)
+        self._activity_wall.pop(key, None)
+        self._activity_persisted.pop(key, None)
+        self._status_ok_at.pop(key, None)
 
     async def ensure_terminal(
         self,
@@ -112,10 +267,17 @@ class Backend(ABC):
         key = self._key(user_id, policy_id)
 
         # Fast path — already tracked and running.
-        if key in self._instances:
-            info = self._instances[key]
+        info = self._instances.get(key)
+        if info is not None:
+            # Skip the backend status inspection while the last confirmed
+            # check is fresh — at hundreds of users this is the difference
+            # between pure dict lookups and 2 Docker API calls per request.
+            if self._status_fresh(key):
+                self._record_activity(key)
+                return info
             st = await self.status(info["instance_id"])
             if st == "running":
+                self._mark_status_ok(key)
                 self._record_activity(key)
                 return info
 
@@ -126,22 +288,35 @@ class Backend(ABC):
         async with self._locks[key]:
             # Re-check after acquiring lock — another request may have
             # already provisioned while we were waiting.
-            if key in self._instances:
-                info = self._instances[key]
+            info = self._instances.get(key)
+            if info is not None:
                 st = await self.status(info["instance_id"])
                 if st == "running":
+                    self._mark_status_ok(key)
                     self._record_activity(key)
                     return info
-                self._instances.pop(key, None)
-                self._specs.pop(key, None)
-                self._activity.pop(key, None)
-                self._activity_wall.pop(key, None)
+                self._forget(key)
 
-            await self._apply_due_reset(user_id, policy_id, spec)
+            # A due scheduled reset must not adopt the pre-reset container —
+            # it tears down any survivor and provisions fresh. Otherwise,
+            # another worker process may have provisioned this terminal
+            # already; adopt it rather than replacing it.
+            if not await self._apply_due_reset(
+                user_id, policy_id, spec, teardown_existing=True
+            ):
+                adopted = await self.lookup(user_id, policy_id)
+                if adopted:
+                    self._instances[key] = adopted
+                    self._specs[key] = spec or {}
+                    self._mark_status_ok(key)
+                    self._record_activity(key)
+                    return adopted
+
             result = await self.provision(user_id, policy_id=policy_id, spec=spec)
             if result:
                 self._instances[key] = result
                 self._specs[key] = spec or {}
+                self._mark_status_ok(key)
                 self._record_activity(key)
             return result
 
@@ -157,10 +332,20 @@ class Backend(ABC):
         self._record_activity(key)
 
     async def _apply_due_reset(
-        self, user_id: str, policy_id: str, spec: Optional[dict]
+        self,
+        user_id: str,
+        policy_id: str,
+        spec: Optional[dict],
+        *,
+        teardown_existing: bool = False,
     ) -> bool:
         if not await reset_due_for(user_id, policy_id, spec):
             return False
+        if teardown_existing:
+            # Tear down any still-running container before wiping its files.
+            stale = await self.lookup(user_id, policy_id)
+            if stale:
+                await self.teardown(stale["instance_id"])
         await self.reset(user_id, policy_id, spec)
         await mark_reset_applied(user_id, policy_id, spec)
         log.info("Reset files for user=%s policy=%s", user_id, policy_id)
@@ -208,16 +393,13 @@ class Backend(ABC):
         ):
             result.matched += 1
             st = await self.status(info["instance_id"])
-            idle = st != "running" or self._is_idle_by_activity(key, spec, now)
+            idle = st != "running" or await self._idle_across_workers(key, spec, now)
             if only_idle and not idle:
                 result.skipped_active += 1
                 continue
 
             await self.teardown(info["instance_id"])
-            self._instances.pop(key, None)
-            self._specs.pop(key, None)
-            self._activity.pop(key, None)
-            self._activity_wall.pop(key, None)
+            self._forget(key)
             self._locks.pop(key, None)
             result.refreshed += 1
 
@@ -311,7 +493,11 @@ class Backend(ABC):
             last_active = self._activity.get(key, now)
             idle_seconds = now - last_active
 
-            if idle_seconds >= timeout_min * 60:
+            # The cross-worker check consults the shared activity record so
+            # traffic handled by another worker process blocks the teardown.
+            if idle_seconds >= timeout_min * 60 and await self._idle_across_workers(
+                key, spec, now
+            ):
                 parts = key.split(":", 1)
                 user_id = parts[0]
                 policy_id = parts[1] if len(parts) > 1 else "default"
@@ -333,8 +519,5 @@ class Backend(ABC):
                     log.warning("Reset due for %s but backend does not support it", key)
                 except Exception:
                     log.exception("Failed to reset files for %s", key)
-                self._instances.pop(key, None)
-                self._specs.pop(key, None)
-                self._activity.pop(key, None)
-                self._activity_wall.pop(key, None)
+                self._forget(key)
                 self._locks.pop(key, None)
