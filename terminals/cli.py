@@ -80,6 +80,7 @@ def serve(host: str | None, port: int | None, api_key: str | None, workers: int 
         # Terminal streams re-compressed per frame in pure Python are a major
         # CPU cost at scale — only enable when explicitly configured.
         ws_per_message_deflate=settings.ws_compression,
+        access_log=settings.access_log,
     )
 
 
