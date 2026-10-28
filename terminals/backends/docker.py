@@ -171,6 +171,8 @@ class DockerBackend(Backend):
             network_name or "default",
         )
 
+        await self._ensure_image(docker, image)
+
         max_conflict_retries = 3
         container = None
         for attempt in range(max_conflict_retries + 1):
@@ -222,6 +224,23 @@ class DockerBackend(Backend):
         result = await self._extract_instance_info(container, instance_name, api_key)
         await self._wait_until_ready(result, timeout=15)
         return result
+
+    async def _ensure_image(self, docker: aiodocker.Docker, image: str) -> None:
+        """Pull the image if the Docker daemon does not have it yet."""
+        try:
+            await docker.images.inspect(image)
+            return
+        except aiodocker.exceptions.DockerError:
+            log.info("Pulling image %s", image)
+        try:
+            progress = await docker.images.pull(image)
+            # aiodocker before 0.27 reports stream errors in the result instead of raising.
+            pull_error = next((entry["error"] for entry in progress if "error" in entry), None)
+            if pull_error:
+                raise RuntimeError(pull_error)
+        except (aiodocker.exceptions.DockerError, RuntimeError) as exc:
+            log.error("Failed to pull image %s: %s", image, exc)
+            raise
 
     async def _wait_until_ready(self, instance: dict, timeout: int = 15) -> None:
         """Poll the container's /health endpoint until it responds."""
